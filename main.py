@@ -1,8 +1,15 @@
 import cv2
 import time
 import threading
+import os
 from ultralytics import YOLO
 from servo_controller import ServoController
+
+# ==========================================
+# FIX QT DISPLAY ISSUES ON RASPBERRY PI
+# ==========================================
+
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 
 # ==========================================
 # GLOBAL VARIABLES
@@ -159,13 +166,15 @@ def main():
     # LOAD YOLO MODEL
     # ==========================================
 
+    print("[INIT] Loading YOLO model...")
     model = YOLO("best.pt")
+    print("[INIT] YOLO model loaded successfully")
 
     # ==========================================
     # OPEN CAMERA
     # ==========================================
 
-    print("Opening webcam...")
+    print("[CAMERA] Opening webcam...")
 
     # Try camera index 0
     cap = cv2.VideoCapture(0)
@@ -173,16 +182,16 @@ def main():
     # Fallback to camera index 1
     if not cap.isOpened():
 
-        print("Trying camera index 1...")
+        print("[CAMERA] Trying camera index 1...")
         cap = cv2.VideoCapture(1)
 
     # If still failed
     if not cap.isOpened():
 
-        print("Cannot open webcam")
+        print("[ERROR] Cannot open webcam")
         return
 
-    print("Webcam opened successfully")
+    print("[CAMERA] Webcam opened successfully")
 
     # ==========================================
     # LOW LATENCY CAMERA SETTINGS
@@ -215,146 +224,156 @@ def main():
     # INITIALIZE SERVO
     # ==========================================
 
-    print("Initializing servo controller...")
+    print("[SERVO] Initializing servo controller...")
     servo_thread = threading.Thread(target=servo_control_worker)
     servo_thread.daemon = True
     servo_thread.start()
     time.sleep(2)  # Wait for servo initialization
 
-    print("====================================")
-    print("PICK & PLACE SYSTEM STARTED")
-    print("====================================")
-    print("Controls:")
+    print("\n" + "="*50)
+    print("✅ PICK & PLACE SYSTEM STARTED")
+    print("="*50)
+    print("📱 Controls:")
     print("  1 = Drop angle 45°")
     print("  2 = Drop angle 90°")
     print("  3 = Drop angle 135°")
     print("  4 = Drop angle 180°")
     print("  P = Execute pick & place")
     print("  Q = Quit")
-    print("====================================\n")
+    print("="*50 + "\n")
 
     prev_time = time.time()
     servo_busy = False
+    frame_count = 0
 
     # ==========================================
     # MAIN LOOP
     # ==========================================
 
-    while True:
+    try:
+        while True:
 
-        # Wait until frame available
-        if latest_frame is None:
-            continue
+            # Wait until frame available
+            if latest_frame is None:
+                time.sleep(0.01)
+                continue
 
-        # Copy latest frame
-        frame = latest_frame.copy()
-        height, width = frame.shape[:2]
+            # Copy latest frame
+            frame = latest_frame.copy()
+            height, width = frame.shape[:2]
+            frame_count += 1
 
+            # ==========================================
+            # YOLO INFERENCE
+            # ==========================================
+
+            results = model(
+                frame,
+                imgsz=320,
+                conf=0.5,
+                half=True,
+                verbose=False
+            )
+
+            # Get annotated frame
+            annotated_frame = results[0].plot()
+
+            # ==========================================
+            # DRAW PICKUP ZONE
+            # ==========================================
+
+            annotated_frame = draw_pickup_zone(annotated_frame, width, height)
+
+            # ==========================================
+            # FPS CALCULATION
+            # ==========================================
+
+            current_time = time.time()
+            fps = 1 / (current_time - prev_time) if (current_time - prev_time) > 0 else 0
+            prev_time = current_time
+
+            # ==========================================
+            # DRAW STATUS
+            # ==========================================
+
+            servo_state = "Busy" if servo_busy else "Ready"
+            annotated_frame = draw_status(annotated_frame, fps, selected_drop_angle, servo_state)
+
+            # ==========================================
+            # SHOW FRAME
+            # ==========================================
+
+            cv2.imshow(
+                "Raspberry Pi - Pick & Place System",
+                annotated_frame
+            )
+
+            # ==========================================
+            # KEYBOARD INPUT HANDLING
+            # ==========================================
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('q') or key == ord('Q'):
+                # Quit
+                print("\n[EXIT] Shutting down...")
+                running = False
+                break
+
+            elif key == ord('p') or key == ord('P'):
+                # Pick and place
+                if servo and not servo_busy:
+                    print(f"\n>>> Executing pick & place to {selected_drop_angle}°...")
+                    servo_busy = True
+                    
+                    # Execute in background thread
+                    pick_thread = threading.Thread(
+                        target=servo.execute_pick_and_place,
+                        args=(selected_drop_angle,)
+                    )
+                    pick_thread.daemon = True
+                    pick_thread.start()
+                    
+                    servo_busy = False
+
+            elif key == ord('1'):
+                # Set drop angle to 45°
+                selected_drop_angle = 45
+                print(f">>> Drop angle set to {selected_drop_angle}°")
+
+            elif key == ord('2'):
+                # Set drop angle to 90°
+                selected_drop_angle = 90
+                print(f">>> Drop angle set to {selected_drop_angle}°")
+
+            elif key == ord('3'):
+                # Set drop angle to 135°
+                selected_drop_angle = 135
+                print(f">>> Drop angle set to {selected_drop_angle}°")
+
+            elif key == ord('4'):
+                # Set drop angle to 180°
+                selected_drop_angle = 180
+                print(f">>> Drop angle set to {selected_drop_angle}°")
+
+    except KeyboardInterrupt:
+        print("\n[EXIT] Interrupted by user")
+        running = False
+
+    finally:
         # ==========================================
-        # YOLO INFERENCE
+        # CLEANUP
         # ==========================================
 
-        results = model(
-            frame,
-            imgsz=320,
-            conf=0.5,
-            half=True,
-            verbose=False
-        )
+        running = False
+        
+        if servo:
+            servo.cleanup()
 
-        # Get annotated frame
-        annotated_frame = results[0].plot()
+        cap.release()
+        cv2.destroyAllWindows()
 
-        # ==========================================
-        # DRAW PICKUP ZONE
-        # ==========================================
-
-        annotated_frame = draw_pickup_zone(annotated_frame, width, height)
-
-        # ==========================================
-        # FPS CALCULATION
-        # ==========================================
-
-        current_time = time.time()
-        fps = 1 / (current_time - prev_time)
-        prev_time = current_time
-
-        # ==========================================
-        # DRAW STATUS
-        # ==========================================
-
-        servo_state = "Busy" if servo_busy else "Ready"
-        annotated_frame = draw_status(annotated_frame, fps, selected_drop_angle, servo_state)
-
-        # ==========================================
-        # SHOW FRAME
-        # ==========================================
-
-        cv2.imshow(
-            "Raspberry Pi - Pick & Place System",
-            annotated_frame
-        )
-
-        # ==========================================
-        # KEYBOARD INPUT HANDLING
-        # ==========================================
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('q'):
-            # Quit
-            running = False
-            break
-
-        elif key == ord('p') or key == ord('P'):
-            # Pick and place
-            if servo and not servo_busy:
-                print(f"\n>>> Executing pick & place to {selected_drop_angle}°...")
-                servo_busy = True
-                
-                # Execute in background thread
-                pick_thread = threading.Thread(
-                    target=servo.execute_pick_and_place,
-                    args=(selected_drop_angle,)
-                )
-                pick_thread.daemon = True
-                pick_thread.start()
-                
-                servo_busy = False
-
-        elif key == ord('1'):
-            # Set drop angle to 45°
-            selected_drop_angle = 45
-            print(f">>> Drop angle set to {selected_drop_angle}°")
-
-        elif key == ord('2'):
-            # Set drop angle to 90°
-            selected_drop_angle = 90
-            print(f">>> Drop angle set to {selected_drop_angle}°")
-
-        elif key == ord('3'):
-            # Set drop angle to 135°
-            selected_drop_angle = 135
-            print(f">>> Drop angle set to {selected_drop_angle}°")
-
-        elif key == ord('4'):
-            # Set drop angle to 180°
-            selected_drop_angle = 180
-            print(f">>> Drop angle set to {selected_drop_angle}°")
-
-    # ==========================================
-    # CLEANUP
-    # ==========================================
-
-    running = False
-    
-    if servo:
-        servo.cleanup()
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-    print("\nProgram stopped")
+        print(f"[EXIT] Program stopped (processed {frame_count} frames)")
 
 
 # ==========================================
